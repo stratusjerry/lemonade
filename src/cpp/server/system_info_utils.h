@@ -238,6 +238,38 @@ inline std::string gpu_display_name(const std::string& marketing_name,
     return marketing_name + " (" + arch + ")";
 }
 
+// A display adapter as DXCore describes it under WSL, where these are the values
+// Windows itself holds for the device.
+struct DxcoreAdapter {
+    std::string description;
+    uint32_t vendor_id = 0;
+    bool hardware = false;
+    bool integrated = false;
+    uint64_t dedicated_bytes = 0;
+    uint64_t shared_bytes = 0;
+};
+
+// The physical AMD GPUs of `gpu_type` ("integrated" or "discrete") among `adapters`.
+// DXCore lists other vendors' GPUs and software rasterizers, such as the Microsoft
+// Basic Render Driver, alongside them.
+inline std::vector<DxcoreAdapter> amd_dxcore_gpus(const std::vector<DxcoreAdapter>& adapters,
+                                                  const std::string& gpu_type) {
+    constexpr uint32_t amd_gpu_vendor_id = 0x1002;
+
+    std::vector<DxcoreAdapter> gpus;
+    for (const auto& adapter : adapters) {
+        if (!adapter.hardware || adapter.vendor_id != amd_gpu_vendor_id) {
+            continue;
+        }
+        if ((gpu_type == "integrated" && !adapter.integrated) ||
+            (gpu_type == "discrete" && adapter.integrated)) {
+            continue;
+        }
+        gpus.push_back(adapter);
+    }
+    return gpus;
+}
+
 // Reads the amdgpu driver's own per-device accounting under `kfd_nodes_dir` (KFD
 // topology) and `drm_dir` (/sys/class/drm). Both are world-readable, unlike the libdrm
 // probe elsewhere in this file's callers, which needs O_RDWR on a render node and so

@@ -373,7 +373,9 @@ hsa_status_t collect_hsa_agent_info(hsa_agent_t agent, void* data) {
     return HSA_STATUS_SUCCESS;
 }
 
-std::vector<RocmAgentInfo> query_rocm_agents_via_hsa_runtime() {
+// nullopt when /dev/dxg exists but no HSA runtime can be loaded to query it, which
+// leaves the GPU unknown rather than absent.
+std::optional<std::vector<RocmAgentInfo>> query_rocm_agents_via_hsa_runtime() {
     std::vector<RocmAgentInfo> agents;
 
     if (!is_dxg_rocm_environment()) {
@@ -382,7 +384,7 @@ std::vector<RocmAgentInfo> query_rocm_agents_via_hsa_runtime() {
 
     HsaRuntimeApi api;
     if (!load_hsa_runtime(api)) {
-        return agents;
+        return std::nullopt;
     }
 
     if (api.init() != HSA_STATUS_SUCCESS) {
@@ -402,13 +404,221 @@ std::vector<RocmAgentInfo> query_rocm_agents_via_hsa_runtime() {
     return agents;
 }
 
-std::vector<RocmAgentInfo> query_rocm_agents() {
+std::optional<std::vector<RocmAgentInfo>> query_rocm_agents() {
     return query_rocm_agents_via_hsa_runtime();
 }
 
-std::vector<GPUInfo> query_dxg_amd_gpus(const std::string& gpu_type) {
+// Minimal DXCore ABI surface for runtime dlopen probing, declared here for the
+// same reason as the HSA one above. DXCore's interfaces are C++ classes, but
+// they are called through explicit method tables: given abstract classes with no
+// implementation in this file, the optimizer resolves each virtual call to the
+// pure-virtual handler. Each table lists only the leading methods, in vtable
+// order, which is all that calling them requires.
+using dxcore_hresult_t = int32_t;
+
+struct DxcoreGuid {
+    uint32_t data1;
+    uint16_t data2;
+    uint16_t data3;
+    uint8_t data4[8];
+};
+
+enum class DxcoreAdapterProperty : uint32_t {
+    DriverDescription = 2,
+    HardwareID = 3,
+    DedicatedAdapterMemory = 7,
+    SharedSystemMemory = 9,
+    IsHardware = 11,
+    IsIntegrated = 12,
+};
+
+struct DxcoreHardwareId {
+    uint32_t vendor_id;
+    uint32_t device_id;
+    uint32_t subsys_id;
+    uint32_t revision;
+};
+
+struct DxcoreUnknownMethods {
+    dxcore_hresult_t (*query_interface)(void* self, const DxcoreGuid* riid, void** object);
+    uint32_t (*add_ref)(void* self);
+    uint32_t (*release)(void* self);
+};
+
+struct DxcoreAdapterMethods {
+    DxcoreUnknownMethods unknown;
+    bool (*is_valid)(void* self);
+    bool (*is_attribute_supported)(void* self, const DxcoreGuid* attribute);
+    bool (*is_property_supported)(void* self, DxcoreAdapterProperty property);
+    dxcore_hresult_t (*get_property)(void* self, DxcoreAdapterProperty property,
+                                     size_t buffer_size, void* property_data);
+    dxcore_hresult_t (*get_property_size)(void* self, DxcoreAdapterProperty property,
+                                          size_t* buffer_size);
+};
+
+struct DxcoreAdapterListMethods {
+    DxcoreUnknownMethods unknown;
+    dxcore_hresult_t (*get_adapter)(void* self, uint32_t index, const DxcoreGuid* riid,
+                                    void** adapter);
+    uint32_t (*get_adapter_count)(void* self);
+};
+
+struct DxcoreAdapterFactoryMethods {
+    DxcoreUnknownMethods unknown;
+    dxcore_hresult_t (*create_adapter_list)(void* self, uint32_t attribute_count,
+                                            const DxcoreGuid* attributes,
+                                            const DxcoreGuid* riid, void** adapter_list);
+};
+
+// A DXCore object begins with the pointer to its method table.
+template <typename Methods>
+struct DxcoreObject {
+    const Methods* methods;
+};
+
+using DxcoreAdapterObject = DxcoreObject<DxcoreAdapterMethods>;
+using DxcoreAdapterListObject = DxcoreObject<DxcoreAdapterListMethods>;
+using DxcoreAdapterFactoryObject = DxcoreObject<DxcoreAdapterFactoryMethods>;
+
+using DxcoreCreateAdapterFactory = dxcore_hresult_t (*)(const DxcoreGuid* riid, void** factory);
+
+constexpr DxcoreGuid IID_IDXCoreAdapterFactory = {
+    0x78ee5945, 0xc36e, 0x4b13, {0xa6, 0x69, 0x00, 0x5d, 0xd1, 0x1c, 0x0f, 0x06}};
+constexpr DxcoreGuid IID_IDXCoreAdapterList = {
+    0x526c7776, 0x40e9, 0x459b, {0xb7, 0x11, 0xf3, 0x2a, 0xd7, 0x6d, 0xfc, 0x28}};
+constexpr DxcoreGuid IID_IDXCoreAdapter = {
+    0xf0db4c7f, 0xfe5a, 0x42a2, {0xbd, 0x62, 0xf2, 0xa6, 0xcf, 0x6f, 0xc8, 0x3e}};
+constexpr DxcoreGuid DXCORE_ADAPTER_ATTRIBUTE_D3D12_CORE_COMPUTE = {
+    0x248e2800, 0xa793, 0x4724, {0xab, 0xaa, 0x23, 0xa6, 0xde, 0x1b, 0xe0, 0x90}};
+
+// libdxcore.so comes with WSL's GPU support, as /dev/dxg does.
+DxcoreCreateAdapterFactory load_dxcore_create_adapter_factory() {
+    static const std::vector<std::string> DXCORE_CANDIDATES = {
+        "libdxcore.so",
+        "/usr/lib/wsl/lib/libdxcore.so"
+    };
+
+    for (const auto& candidate : DXCORE_CANDIDATES) {
+        void* handle = dlopen(candidate.c_str(), RTLD_LAZY | RTLD_LOCAL);
+        if (!handle) {
+            continue;
+        }
+
+        void* symbol = dlsym(handle, "DXCoreCreateAdapterFactory");
+        if (symbol != nullptr) {
+            return reinterpret_cast<DxcoreCreateAdapterFactory>(symbol);
+        }
+
+        dlclose(handle);
+    }
+
+    return nullptr;
+}
+
+template <typename T>
+void read_dxcore_property(DxcoreAdapterObject* adapter, DxcoreAdapterProperty property,
+                          T& value) {
+    T read{};
+    if (adapter->methods->get_property(adapter, property, sizeof(T), &read) >= 0) {
+        value = read;
+    }
+}
+
+system_info_detail::DxcoreAdapter read_dxcore_adapter(DxcoreAdapterObject* adapter) {
+    system_info_detail::DxcoreAdapter info;
+
+    size_t description_size = 0;
+    if (adapter->methods->get_property_size(adapter, DxcoreAdapterProperty::DriverDescription,
+                                            &description_size) >= 0 &&
+        description_size > 0) {
+        std::vector<char> description(description_size, '\0');
+        if (adapter->methods->get_property(adapter, DxcoreAdapterProperty::DriverDescription,
+                                           description.size(), description.data()) >= 0) {
+            info.description = trim_copy(std::string(
+                description.begin(), std::find(description.begin(), description.end(), '\0')));
+        }
+    }
+
+    DxcoreHardwareId hardware_id = {};
+    read_dxcore_property(adapter, DxcoreAdapterProperty::HardwareID, hardware_id);
+    info.vendor_id = hardware_id.vendor_id;
+    read_dxcore_property(adapter, DxcoreAdapterProperty::IsHardware, info.hardware);
+    read_dxcore_property(adapter, DxcoreAdapterProperty::IsIntegrated, info.integrated);
+    read_dxcore_property(adapter, DxcoreAdapterProperty::DedicatedAdapterMemory,
+                         info.dedicated_bytes);
+    read_dxcore_property(adapter, DxcoreAdapterProperty::SharedSystemMemory, info.shared_bytes);
+    return info;
+}
+
+std::vector<system_info_detail::DxcoreAdapter> query_dxcore_adapters() {
+    std::vector<system_info_detail::DxcoreAdapter> adapters;
+
+    // Loaded once and never unloaded, because this probe reruns on every model load.
+    static const DxcoreCreateAdapterFactory create_adapter_factory =
+        load_dxcore_create_adapter_factory();
+    if (!create_adapter_factory) {
+        return adapters;
+    }
+
+    void* factory_object = nullptr;
+    if (create_adapter_factory(&IID_IDXCoreAdapterFactory, &factory_object) < 0 ||
+        factory_object == nullptr) {
+        return adapters;
+    }
+    auto* factory = static_cast<DxcoreAdapterFactoryObject*>(factory_object);
+
+    void* list_object = nullptr;
+    if (factory->methods->create_adapter_list(
+            factory, 1, &DXCORE_ADAPTER_ATTRIBUTE_D3D12_CORE_COMPUTE, &IID_IDXCoreAdapterList,
+            &list_object) >= 0 &&
+        list_object != nullptr) {
+        auto* list = static_cast<DxcoreAdapterListObject*>(list_object);
+        const uint32_t adapter_count = list->methods->get_adapter_count(list);
+        for (uint32_t index = 0; index < adapter_count; ++index) {
+            void* adapter_object = nullptr;
+            if (list->methods->get_adapter(list, index, &IID_IDXCoreAdapter,
+                                           &adapter_object) < 0 ||
+                adapter_object == nullptr) {
+                continue;
+            }
+            auto* adapter = static_cast<DxcoreAdapterObject*>(adapter_object);
+            adapters.push_back(read_dxcore_adapter(adapter));
+            adapter->methods->unknown.release(adapter);
+        }
+        list->methods->unknown.release(list);
+    }
+
+    factory->methods->unknown.release(factory);
+    return adapters;
+}
+
+// What WSL knows about the GPU before any ROCm runtime is installed: the adapter
+// Windows passes through, under the name and memory split it has on Windows.
+std::vector<GPUInfo> query_dxcore_amd_gpus(const std::string& gpu_type) {
     std::vector<GPUInfo> gpus;
-    for (const auto& agent : query_rocm_agents()) {
+    for (const auto& adapter :
+         system_info_detail::amd_dxcore_gpus(query_dxcore_adapters(), gpu_type)) {
+        GPUInfo gpu;
+        gpu.name = adapter.description;
+        gpu.display_name = system_info_detail::gpu_display_name(
+            adapter.description, identify_rocm_arch_from_name(adapter.description));
+        gpu.available = true;
+        gpu.vram_gb = round_gb(static_cast<double>(adapter.dedicated_bytes) / BYTES_PER_GIB);
+        gpu.virtual_gb = round_gb(static_cast<double>(adapter.shared_bytes) / BYTES_PER_GIB);
+        gpus.push_back(gpu);
+    }
+
+    return gpus;
+}
+
+std::vector<GPUInfo> query_dxg_amd_gpus(const std::string& gpu_type) {
+    const auto agents = query_rocm_agents();
+    if (!agents) {
+        return query_dxcore_amd_gpus(gpu_type);
+    }
+
+    std::vector<GPUInfo> gpus;
+    for (const auto& agent : *agents) {
         if ((gpu_type == "integrated" && !agent.is_integrated) ||
             (gpu_type == "discrete" && agent.is_integrated)) {
             continue;

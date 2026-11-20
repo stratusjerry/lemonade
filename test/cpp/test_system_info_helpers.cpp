@@ -18,6 +18,8 @@
 #include <utility>
 #include <vector>
 
+using lemon::system_info_detail::DxcoreAdapter;
+using lemon::system_info_detail::amd_dxcore_gpus;
 using lemon::system_info_detail::compute_cap_to_sm;
 using lemon::system_info_detail::cuda_min_driver_version;
 using lemon::system_info_detail::cuda_supported_archs;
@@ -392,6 +394,38 @@ int main() {
     failures += !expect_string(
         "neither half available yields an empty name",
         gpu_display_name("", ""), "");
+
+    {
+        const DxcoreAdapter apu{"AMD Radeon(TM) 8060S Graphics", 0x1002, true, true};
+        const DxcoreAdapter radeon{"AMD Radeon RX 9070 XT", 0x1002, true, false};
+        const DxcoreAdapter geforce{"NVIDIA GeForce RTX 4090", 0x10de, true, false};
+        const DxcoreAdapter software{"Microsoft Basic Render Driver", 0x1414, false, false};
+        const std::vector<DxcoreAdapter> adapters = {software, geforce, radeon, apu};
+
+        const auto integrated = amd_dxcore_gpus(adapters, "integrated");
+        failures += !expect_bool("DXCore lists one integrated AMD GPU",
+                                 integrated.size() == 1, true);
+        failures += !expect_string(
+            "the integrated AMD GPU is the APU",
+            integrated.empty() ? "" : integrated.front().description,
+            "AMD Radeon(TM) 8060S Graphics");
+
+        const auto discrete = amd_dxcore_gpus(adapters, "discrete");
+        failures += !expect_bool("DXCore lists one discrete AMD GPU",
+                                 discrete.size() == 1, true);
+        failures += !expect_string(
+            "another vendor's GPU and a software rasterizer are not AMD GPUs",
+            discrete.empty() ? "" : discrete.front().description,
+            "AMD Radeon RX 9070 XT");
+
+        failures += !expect_bool(
+            "a software adapter is not a GPU even under AMD's vendor ID",
+            amd_dxcore_gpus({{"AMD software adapter", 0x1002, false, false}}, "discrete")
+                .empty(),
+            true);
+        failures += !expect_bool("no adapters, no AMD GPUs",
+                                 amd_dxcore_gpus({}, "integrated").empty(), true);
+    }
 
     // The largest GPU-accessible memory pool is the stable primary, not the
     // GPU with the highest instantaneous utilization or VRAM usage.
