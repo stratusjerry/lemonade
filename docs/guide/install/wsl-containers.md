@@ -4,6 +4,8 @@
 
 `wslc` publishes `-p 13305:13305` on `127.0.0.1` only, so the server is reachable from this machine and not from the network. A container session gets half of the machine's memory by default. [WSL container settings](https://learn.microsoft.com/windows/wsl/wsl-container-settings) change both.
 
+Lemonade installed on Windows uses port 13305 as well. While it is running, `wslc run` fails with `WSAEADDRINUSE`, so choose **Quit Lemonade** from its tray icon first, or publish another port, for example `-p 13306:13305`.
+
 ## Run with Default Configuration
 
 ```powershell
@@ -23,9 +25,9 @@ Once the container is running, verify it's working:
 curl.exe http://localhost:13305/api/v1/models
 ```
 
-## Run with AMD GPU Passthrough using ROCm
+## Run with GPU Passthrough
 
-Install the Windows driver that [ROCm for WSL](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/wsl/howto_wsl.html) lists. ROCm itself does not have to be installed in a WSL distribution: `--gpus all` gives the container `/dev/dxg` and WSL's GPU libraries, and Lemonade downloads its own ROCm runtime.
+`--gpus all` gives the container `/dev/dxg` and WSL's GPU libraries:
 
 ```powershell
 wslc run -d `
@@ -39,7 +41,11 @@ wslc run -d `
   ghcr.io/lemonade-sdk/lemonade-server:latest
 ```
 
-Then make ROCm the default backend for llama.cpp:
+The image includes Dozen, Mesa's driver for Vulkan on Direct3D 12, so llama.cpp's default backend, Vulkan, then runs on the GPU. To confirm, `wslc exec lemonade-server vulkaninfo --summary` lists the GPU as a `Microsoft Direct3D12` device. Dozen is not a conformant Vulkan implementation, and Mesa labels it for testing use.
+
+### Use ROCm on an AMD GPU
+
+ROCm is faster than Vulkan on an AMD GPU. Install the Windows driver that [ROCm for WSL](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/wsl/howto_wsl.html) lists. ROCm itself does not have to be installed in a WSL distribution, because Lemonade downloads its own ROCm runtime. Then make ROCm the default backend for llama.cpp:
 
 ```powershell
 wslc exec lemonade-server lemonade config set llamacpp.backend=rocm

@@ -244,6 +244,7 @@ lemonade config set llamacpp.rocm_bin=b1260
 - ROCm requires compatible AMD GPU (see above)
 - CUDA requires compatible NVIDIA GPU (see above)
 - System backend requires manual llama-server installation
+- In a [WSL container](../install/wsl-containers.md), Vulkan runs on the GPU through Mesa's Dozen driver, and ROCm is faster on an AMD GPU
 
 ### Windows
 - Supported: CPU, Vulkan, ROCm, CUDA
